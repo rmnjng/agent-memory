@@ -1,0 +1,14 @@
+[Unit]
+Description=Agent Memory Web Viewer
+After=network.target docker.service
+
+[Service]
+Type=simple
+ExecStartPre=/usr/bin/docker start agent-memory-db
+ExecStart=/usr/bin/python3 %h/agent-memory/web.py --port 7337
+Restart=on-failure
+RestartSec=5
+Environment=HOME=%h
+
+[Install]
+WantedBy=default.target

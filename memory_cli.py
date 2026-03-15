@@ -228,13 +228,10 @@ def cmd_recall(args):
     retrieved_ids = []
     for row in cur.fetchall():
         results["memories"].append({
-            "id": str(row["id"]),
             "category": row["category"],
             "content": row["content"],
             "confidence": round(row["confidence"], 3),
             "similarity": round(row["similarity"], 3),
-            "status": row["status"],
-            "created_at": row["created_at"].isoformat()
         })
         retrieved_ids.append(row["id"])
         # Bump confidence for retrieved memories
@@ -356,9 +353,7 @@ def cmd_inspect(args):
     rows = cur.fetchall()
     print(f"=== memories ({args.project}) — {len(rows)} results ===\n")
     for row in rows:
-        row_clean = {k: (v.isoformat() if isinstance(v, datetime) else
-                         str(v)[:200] if isinstance(v, str) and len(str(v)) > 200 else
-                         v)
+        row_clean = {k: (v.isoformat() if isinstance(v, datetime) else v)
                      for k, v in row.items()
                      if not k.endswith("_embedding") and v is not None}
         print(json.dumps(row_clean, indent=2, default=str))
@@ -406,11 +401,9 @@ def cmd_add(args):
     conn.commit()
     conn.close()
 
-    print(f"Stored memory: {mem_id}")
-    print(f"  Category: {args.category}")
-    print(f"  Content:  {content[:100]}{'...' if len(content) > 100 else ''}")
+    print(f"Stored: {mem_id}")
     if superseded:
-        print(f"  Superseded {superseded} similar memories")
+        print(f"Superseded {superseded} similar memories")
 
 
 def cmd_forget(args):
@@ -525,14 +518,11 @@ def _check_contradictions(cur, project: str, new_memories: list[dict]) -> int:
 
 def _print_recall_markdown(results: dict, query: str):
     """Pretty-print recall results as markdown."""
-    print(f"# Memory Recall: {query}\n")
-
     if results["memories"]:
         print(f"## Memories ({len(results['memories'])} found)\n")
         for m in results["memories"]:
-            conf_bar = "█" * int(m["confidence"] * 10) + "░" * (10 - int(m["confidence"] * 10))
-            print(f"- **[{m['category']}]** (conf: {conf_bar} {m['confidence']:.2f} | sim: {m['similarity']:.2f})")
-            print(f"  {m['content'][:200]}")
+            print(f"- **[{m['category']}]** (conf: {m['confidence']:.2f} | sim: {m['similarity']:.2f})")
+            print(f"  {m['content']}")
             print()
     else:
         print("_No memories found. Fresh start or query needs refinement._")

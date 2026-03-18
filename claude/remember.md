@@ -26,10 +26,23 @@ One concise fact or insight. Can safely contain $dollar signs, "quotes", and `ba
 MEMORY
 ```
 
-Categories: `convention`, `gotcha`, `pattern`, `preference`, `dependency`, `optimization`
+For architectural decisions that should outlast long unrelated sprints, add `--longevity high`:
+```bash
+python3 ~/agent-memory/memory_cli.py add \
+  --project YOUR_PROJECT \
+  --category decision \
+  --longevity high \
+  --content - <<'MEMORY'
+Core architectural fact unlikely to change for the life of this project.
+MEMORY
+```
+
+Categories: `convention`, `gotcha`, `pattern`, `preference`, `dependency`, `optimization`, `decision`
 
 Guidelines:
 - One memory per fact. "S3 env vars are named X not Y" is one memory. "dotenv loads from cwd" is another.
+- Use `decision` for architectural choices that constrain future work (e.g. "decided to use X over Y because Z").
+- Use `--longevity high` for facts unlikely to change for the life of the project (security rules, core architecture decisions). Default (`normal`) for everything else. There is no `permanent` — even important memories should eventually fade if truly abandoned, preventing stale facts from accumulating.
 - Be specific and actionable. Include file paths, env var names, concrete details.
 - Skip anything vague, obvious, or session-specific.
-- Check recall first to avoid duplicates — `add` auto-supersedes similar memories (>0.95 cosine).
+- Check recall first to avoid duplicates — `add` auto-supersedes similar memories (>0.85 cosine).

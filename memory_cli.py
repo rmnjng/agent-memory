@@ -8,11 +8,13 @@ Usage:
 Commands:
     status      Health check
     recall      Retrieve relevant memories before a task
+    revitalize  Boost decayed memories back to a minimum confidence floor
     decay       Run decay cycle (manual maintenance)
     inspect     Browse memories
     forget      Archive or delete a memory
     export      Dump project data to JSON
     import      Restore from backup
+    migrate     Apply pending schema migrations
 """
 
 import argparse
@@ -41,10 +43,35 @@ EMBED_SERVER_URL = os.environ.get("AGENT_MEMORY_EMBED_URL", "http://localhost:73
 
 CATEGORIES = ["convention", "gotcha", "pattern", "preference", "dependency", "optimization", "decision"]
 
-# Passive decay applied to non-retrieved memories on each recall
-PASSIVE_DECAY_PER_RECALL = 0.005
+# Base passive decay per recall — actual rate is dynamic: BASE / max(1, active_count / REFERENCE_POOL)
+PASSIVE_DECAY_BASE = 0.005
+REFERENCE_POOL_SIZE = 150   # pool size at which full base rate applies; larger = slower decay
+
 STALE_THRESHOLD = 0.3
 ARCHIVE_THRESHOLD = 0.1
+
+# Minimum cosine similarity for a memory to appear in recall results.
+# Memories below this floor are also exempt from passive decay (they're "nearby but not retrieved").
+SIM_FLOOR = 0.4
+
+# Per-category decay multipliers — applied on top of the dynamic base rate.
+# gotcha/convention/decision are permanent facts; they should almost never decay.
+CATEGORY_DECAY_MULTIPLIERS = {
+    "gotcha":       0.2,
+    "convention":   0.2,
+    "decision":     0.3,
+    "dependency":   0.5,
+    "pattern":      0.7,
+    "preference":   1.0,
+    "optimization": 1.0,
+}
+
+# Per-memory longevity → decay_multiplier stored on the row.
+# The final per-recall decay for a memory = dynamic_rate * category_factor * decay_multiplier
+LONGEVITY_VALUES = {
+    "high":   0.2,   # decays at 20% of the already-reduced category rate (~thousands of sessions)
+    "normal": 1.0,   # default
+}
 
 # Lazy-loaded local model fallback
 _model = None
@@ -106,6 +133,38 @@ def get_conn(db_url: str = DEFAULT_DB_URL):
     return conn
 
 
+# ─── Schema Migrations ───────────────────────────────────────────────────────
+
+MIGRATIONS = {
+    3: """
+        ALTER TABLE memories
+            ADD COLUMN IF NOT EXISTS decay_multiplier REAL NOT NULL DEFAULT 1.0
+                CHECK (decay_multiplier >= 0.0 AND decay_multiplier <= 1.0);
+        INSERT INTO schema_version (version) VALUES (3) ON CONFLICT DO NOTHING;
+    """,
+}
+
+
+def _get_schema_version(cur) -> int:
+    try:
+        cur.execute("SELECT MAX(version) FROM schema_version")
+        row = cur.fetchone()
+        return row[0] if row and row[0] else 0
+    except Exception:
+        return 0
+
+
+def _ensure_migrations(conn):
+    """Apply any pending migrations silently. Called on every connection."""
+    cur = conn.cursor()
+    current = _get_schema_version(cur)
+    for version, sql in sorted(MIGRATIONS.items()):
+        if version > current:
+            cur.execute(sql)
+            conn.commit()
+    cur.close()
+
+
 # ─── Commands ────────────────────────────────────────────────────────────────
 
 def cmd_status(args):
@@ -114,6 +173,7 @@ def cmd_status(args):
 
     try:
         conn = get_conn(args.db_url)
+        _ensure_migrations(conn)
         cur = conn.cursor()
         cur.execute("SELECT version()")
         pg_version = cur.fetchone()[0].split(",")[0]
@@ -199,31 +259,37 @@ def cmd_recall(args):
     query_vec = embed_query(args.query)
 
     conn = get_conn(args.db_url)
+    _ensure_migrations(conn)
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
     results = {"memories": [], "_trimmed": 0}
 
-    status_filter = "('active', 'stale')" if args.include_stale else "('active')"
+    # Always include stale — a highly relevant stale memory should resurface.
+    # The similarity floor (SIM_FLOOR) keeps noise out instead.
+    status_filter = "('active', 'stale')"
 
     category_filter = ""
-    params = [query_vec, args.project]
+    cat_params = []
     if args.category:
         cats = [c.strip() for c in args.category.split(",")]
         placeholders = ",".join(["%s"] * len(cats))
         category_filter = f"AND category IN ({placeholders})"
-        params.extend(cats)
+        cat_params = cats
 
     cur.execute(f"""
         SELECT id, category, content, confidence, status, last_referenced, created_at,
+               decay_multiplier,
                1 - (content_embedding <=> %s::vector) AS similarity
         FROM memories
-        WHERE project = %s AND status IN {status_filter} {category_filter}
+        WHERE project = %s AND status IN {status_filter}
+          AND 1 - (content_embedding <=> %s::vector) >= %s
+          {category_filter}
         ORDER BY (1 - (content_embedding <=> %s::vector)) * 0.5
                  + confidence * 0.3
                  + (1.0 / (1.0 + EXTRACT(EPOCH FROM NOW() - last_referenced) / 86400.0 * 0.1)) * 0.2
         DESC
         LIMIT %s
-    """, params + [query_vec] + [args.top_k])
+    """, [query_vec, args.project, query_vec, SIM_FLOOR] + cat_params + [query_vec, args.top_k])
 
     retrieved_ids = []
     for row in cur.fetchall():
@@ -234,40 +300,89 @@ def cmd_recall(args):
             "similarity": round(row["similarity"], 3),
         })
         retrieved_ids.append(row["id"])
-        # Bump confidence for retrieved memories
+        # Boost confidence for retrieved memories
         cur.execute("""
             UPDATE memories SET last_referenced = NOW(),
                    confidence = LEAST(1.0, confidence + 0.1)
             WHERE id = %s
         """, (row["id"],))
 
-    # Passive decay: non-retrieved memories lose a tiny amount per recall
+    # Dynamic decay rate: slower when the pool is large.
+    cur.execute(
+        "SELECT COUNT(*) FROM memories WHERE project = %s AND status IN ('active', 'stale')",
+        (args.project,)
+    )
+    active_count = cur.fetchone()["count"]
+    dynamic_rate = PASSIVE_DECAY_BASE / max(1.0, active_count / REFERENCE_POOL_SIZE)
+
+    # Passive decay: only affects memories BELOW the sim floor (truly unrelated to this recall).
+    # Memories near the top-k boundary but above the floor are exempt — they're relevant,
+    # they just didn't make the cut this time.
+    # Decay is further scaled by category multiplier and the per-memory decay_multiplier.
     if retrieved_ids:
         placeholders = ",".join(["%s"] * len(retrieved_ids))
         cur.execute(f"""
-            UPDATE memories
-            SET confidence = GREATEST(0.0, confidence - {PASSIVE_DECAY_PER_RECALL}),
+            WITH decay_calc AS (
+                SELECT id,
+                    GREATEST(0.0,
+                        confidence - %s *
+                        CASE category
+                            WHEN 'gotcha'       THEN 0.2
+                            WHEN 'convention'   THEN 0.2
+                            WHEN 'decision'     THEN 0.3
+                            WHEN 'dependency'   THEN 0.5
+                            WHEN 'pattern'      THEN 0.7
+                            ELSE 1.0
+                        END * decay_multiplier
+                    ) AS new_confidence
+                FROM memories
+                WHERE project = %s AND status IN ('active', 'stale')
+                  AND id NOT IN ({placeholders})
+                  AND 1 - (content_embedding <=> %s::vector) < %s
+            )
+            UPDATE memories m
+            SET confidence = dc.new_confidence,
                 status = CASE
-                    WHEN GREATEST(0.0, confidence - {PASSIVE_DECAY_PER_RECALL}) < {ARCHIVE_THRESHOLD} THEN 'archived'
-                    WHEN GREATEST(0.0, confidence - {PASSIVE_DECAY_PER_RECALL}) < {STALE_THRESHOLD} THEN 'stale'
-                    ELSE status
+                    WHEN dc.new_confidence < %s THEN 'archived'
+                    WHEN dc.new_confidence < %s THEN 'stale'
+                    ELSE m.status
                 END,
                 updated_at = NOW()
-            WHERE project = %s AND status IN ('active', 'stale')
-              AND id NOT IN ({placeholders})
-        """, [args.project] + list(retrieved_ids))
+            FROM decay_calc dc
+            WHERE m.id = dc.id
+        """, [dynamic_rate, args.project] + list(retrieved_ids) + [query_vec, SIM_FLOOR,
+              ARCHIVE_THRESHOLD, STALE_THRESHOLD])
     else:
+        # No retrievals — decay everything below the sim floor
         cur.execute(f"""
-            UPDATE memories
-            SET confidence = GREATEST(0.0, confidence - {PASSIVE_DECAY_PER_RECALL}),
+            WITH decay_calc AS (
+                SELECT id,
+                    GREATEST(0.0,
+                        confidence - %s *
+                        CASE category
+                            WHEN 'gotcha'       THEN 0.2
+                            WHEN 'convention'   THEN 0.2
+                            WHEN 'decision'     THEN 0.3
+                            WHEN 'dependency'   THEN 0.5
+                            WHEN 'pattern'      THEN 0.7
+                            ELSE 1.0
+                        END * decay_multiplier
+                    ) AS new_confidence
+                FROM memories
+                WHERE project = %s AND status IN ('active', 'stale')
+                  AND 1 - (content_embedding <=> %s::vector) < %s
+            )
+            UPDATE memories m
+            SET confidence = dc.new_confidence,
                 status = CASE
-                    WHEN GREATEST(0.0, confidence - {PASSIVE_DECAY_PER_RECALL}) < {ARCHIVE_THRESHOLD} THEN 'archived'
-                    WHEN GREATEST(0.0, confidence - {PASSIVE_DECAY_PER_RECALL}) < {STALE_THRESHOLD} THEN 'stale'
-                    ELSE status
+                    WHEN dc.new_confidence < %s THEN 'archived'
+                    WHEN dc.new_confidence < %s THEN 'stale'
+                    ELSE m.status
                 END,
                 updated_at = NOW()
-            WHERE project = %s AND status IN ('active', 'stale')
-        """, [args.project])
+            FROM decay_calc dc
+            WHERE m.id = dc.id
+        """, [dynamic_rate, args.project, query_vec, SIM_FLOOR, ARCHIVE_THRESHOLD, STALE_THRESHOLD])
 
     conn.commit()
     conn.close()
@@ -281,15 +396,62 @@ def cmd_recall(args):
         _print_recall_markdown(results, args.query)
 
 
+def cmd_revitalize(args):
+    """Boost all decayed memories back to a minimum confidence floor."""
+    conn = get_conn(args.db_url)
+    _ensure_migrations(conn)
+    cur = conn.cursor()
+
+    where_clauses = ["project = %s", "status IN ('active', 'stale')", "confidence < %s"]
+    params = [args.project, args.min_confidence]
+
+    if args.category:
+        cats = [c.strip() for c in args.category.split(",")]
+        placeholders = ",".join(["%s"] * len(cats))
+        where_clauses.append(f"category IN ({placeholders})")
+        params.extend(cats)
+
+    where = " AND ".join(where_clauses)
+
+    if args.dry_run:
+        cur.execute(f"SELECT COUNT(*) FROM memories WHERE {where}", params)
+        count = cur.fetchone()[0]
+        print(f"Would revitalize {count} memories to min confidence {args.min_confidence}")
+        conn.close()
+        return
+
+    cur.execute(f"""
+        UPDATE memories
+        SET confidence = %s,
+            status = CASE WHEN %s >= %s THEN 'active' ELSE status END,
+            updated_at = NOW()
+        WHERE {where}
+    """, [args.min_confidence, args.min_confidence, STALE_THRESHOLD] + params)
+
+    affected = cur.rowcount
+    conn.commit()
+    conn.close()
+    print(f"Revitalized {affected} memories to confidence >= {args.min_confidence}")
+
+
 def cmd_decay(args):
     """Run manual decay cycle on memories (maintenance tool)."""
     conn = get_conn(args.db_url)
+    _ensure_migrations(conn)
     cur = conn.cursor()
 
     if args.dry_run:
         cur.execute("""
-            SELECT id, content, confidence,
-                   confidence - %s AS projected_confidence
+            SELECT id, category, content, confidence, decay_multiplier,
+                   confidence - %s *
+                       CASE category
+                           WHEN 'gotcha'       THEN 0.2
+                           WHEN 'convention'   THEN 0.2
+                           WHEN 'decision'     THEN 0.3
+                           WHEN 'dependency'   THEN 0.5
+                           WHEN 'pattern'      THEN 0.7
+                           ELSE 1.0
+                       END * decay_multiplier AS projected_confidence
             FROM memories
             WHERE project = %s AND status IN ('active', 'stale')
             ORDER BY confidence ASC
@@ -297,26 +459,42 @@ def cmd_decay(args):
 
         print(f"=== Decay Dry Run ({args.project}) ===\n")
         for row in cur.fetchall():
-            new_conf = max(0, row[3])
+            new_conf = max(0, row[5])
             status = "active"
             if new_conf < args.archive_threshold:
                 status = "→ archived"
             elif new_conf < args.stale_threshold:
                 status = "→ stale"
-            print(f"  [{row[2]:.3f} → {new_conf:.3f}] {status:12s} | {row[1][:80]}")
+            print(f"  [{row[3]:.3f} → {new_conf:.3f}] {status:12s} [{row[1]:12s}] | {row[2][:70]}")
     else:
         cur.execute("""
-            UPDATE memories
-            SET confidence = GREATEST(0.0, confidence - %s),
+            WITH decay_calc AS (
+                SELECT id,
+                    GREATEST(0.0,
+                        confidence - %s *
+                        CASE category
+                            WHEN 'gotcha'       THEN 0.2
+                            WHEN 'convention'   THEN 0.2
+                            WHEN 'decision'     THEN 0.3
+                            WHEN 'dependency'   THEN 0.5
+                            WHEN 'pattern'      THEN 0.7
+                            ELSE 1.0
+                        END * decay_multiplier
+                    ) AS new_confidence
+                FROM memories
+                WHERE project = %s AND status IN ('active', 'stale')
+            )
+            UPDATE memories m
+            SET confidence = dc.new_confidence,
                 status = CASE
-                    WHEN GREATEST(0.0, confidence - %s) < %s THEN 'archived'
-                    WHEN GREATEST(0.0, confidence - %s) < %s THEN 'stale'
-                    ELSE status
+                    WHEN dc.new_confidence < %s THEN 'archived'
+                    WHEN dc.new_confidence < %s THEN 'stale'
+                    ELSE m.status
                 END,
                 updated_at = NOW()
-            WHERE project = %s AND status IN ('active', 'stale')
-        """, (args.decay_rate, args.decay_rate, args.archive_threshold,
-              args.decay_rate, args.stale_threshold, args.project))
+            FROM decay_calc dc
+            WHERE m.id = dc.id
+        """, (args.decay_rate, args.project, args.archive_threshold, args.stale_threshold))
         affected = cur.rowcount
         conn.commit()
         print(f"Decayed {affected} memories in project '{args.project}'.")
@@ -327,6 +505,7 @@ def cmd_decay(args):
 def cmd_inspect(args):
     """Browse memories for a project."""
     conn = get_conn(args.db_url)
+    _ensure_migrations(conn)
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
     where_clauses = ["project = %s"]
@@ -369,16 +548,19 @@ def cmd_add(args):
         print("ERROR: Empty content.")
         sys.exit(1)
 
+    decay_multiplier = LONGEVITY_VALUES.get(args.longevity, 1.0)
+
     conn = get_conn(args.db_url)
+    _ensure_migrations(conn)
     cur = conn.cursor()
 
     content_vec = embed(content)
 
     mem_id = str(uuid.uuid4())
     cur.execute("""
-        INSERT INTO memories (id, project, category, content, content_embedding)
-        VALUES (%s, %s, %s, %s, %s::vector)
-    """, (mem_id, args.project, args.category, content, content_vec))
+        INSERT INTO memories (id, project, category, content, content_embedding, decay_multiplier)
+        VALUES (%s, %s, %s, %s, %s::vector, %s)
+    """, (mem_id, args.project, args.category, content, content_vec, decay_multiplier))
 
     # Check for near-duplicates and supersede them
     superseded = 0
@@ -401,7 +583,8 @@ def cmd_add(args):
     conn.commit()
     conn.close()
 
-    print(f"Stored: {mem_id}")
+    longevity_note = f" (longevity: {args.longevity})" if args.longevity != "normal" else ""
+    print(f"Stored: {mem_id}{longevity_note}")
     if superseded:
         print(f"Superseded {superseded} similar memories")
 
@@ -409,6 +592,7 @@ def cmd_add(args):
 def cmd_forget(args):
     """Archive or hard-delete a memory."""
     conn = get_conn(args.db_url)
+    _ensure_migrations(conn)
     cur = conn.cursor()
 
     if args.hard:
@@ -428,9 +612,30 @@ def cmd_forget(args):
     conn.close()
 
 
+def cmd_migrate(args):
+    """Apply pending schema migrations."""
+    conn = get_conn(args.db_url)
+    cur = conn.cursor()
+    current = _get_schema_version(cur)
+    print(f"Current schema version: v{current}")
+    pending = [v for v in sorted(MIGRATIONS.keys()) if v > current]
+    if not pending:
+        print("No pending migrations.")
+        conn.close()
+        return
+    for version in pending:
+        print(f"Applying migration v{version}...")
+        cur.execute(MIGRATIONS[version])
+        conn.commit()
+        print(f"  v{version} applied.")
+    conn.close()
+    print("Done.")
+
+
 def cmd_export(args):
     """Export project memories to JSON."""
     conn = get_conn(args.db_url)
+    _ensure_migrations(conn)
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
     where = "WHERE project = %s"
@@ -465,6 +670,7 @@ def cmd_import(args):
 
     project = args.project or data.get("project", "unknown")
     conn = get_conn(args.db_url)
+    _ensure_migrations(conn)
     cur = conn.cursor()
 
     imported = 0
@@ -488,7 +694,7 @@ def cmd_import(args):
     print(f"Imported {imported} memories into project '{project}'")
 
 
-# ─── Decay (internal) ────────────────────────────────────────────────────────
+# ─── Supersede check (internal) ──────────────────────────────────────────────
 
 def _check_contradictions(cur, project: str, new_memories: list[dict]) -> int:
     """Check if new memories contradict existing ones. Same category, high similarity → supersede."""
@@ -549,9 +755,17 @@ def main():
     p_recall.add_argument("--top-k", type=int, default=10, help="Max results")
     p_recall.add_argument("--max-tokens", type=int, default=None,
                           help="Token budget; trims lowest-similarity items first")
-    p_recall.add_argument("--include-stale", action="store_true")
     p_recall.add_argument("--category", help="Comma-separated categories to filter")
     p_recall.add_argument("--format", default="markdown", choices=["markdown", "json"])
+
+    # revitalize
+    p_revitalize = subparsers.add_parser("revitalize",
+        help="Boost decayed memories back to a minimum confidence floor")
+    p_revitalize.add_argument("--project", required=True)
+    p_revitalize.add_argument("--min-confidence", type=float, default=0.7,
+                               help="Floor confidence to restore to (default: 0.7)")
+    p_revitalize.add_argument("--category", help="Comma-separated categories to limit scope")
+    p_revitalize.add_argument("--dry-run", action="store_true")
 
     # decay (manual maintenance)
     p_decay = subparsers.add_parser("decay", help="Run manual decay cycle")
@@ -561,6 +775,9 @@ def main():
                          help="Flat confidence reduction per run (default: 0.05)")
     p_decay.add_argument("--stale-threshold", type=float, default=STALE_THRESHOLD)
     p_decay.add_argument("--archive-threshold", type=float, default=ARCHIVE_THRESHOLD)
+
+    # migrate
+    subparsers.add_parser("migrate", help="Apply pending schema migrations")
 
     # inspect
     p_inspect = subparsers.add_parser("inspect", help="Browse memories")
@@ -577,6 +794,8 @@ def main():
     p_add.add_argument("--category", required=True, choices=CATEGORIES, help="Memory category")
     p_add.add_argument("--content", required=True,
                        help="The memory content, or '-' to read from stdin")
+    p_add.add_argument("--longevity", default="normal", choices=list(LONGEVITY_VALUES.keys()),
+                       help="Decay resistance: high (0.2x, ~thousands of sessions), normal (default)")
 
     # forget
     p_forget = subparsers.add_parser("forget", help="Archive/delete a memory")
@@ -598,8 +817,10 @@ def main():
 
     cmd_map = {
         "status": cmd_status, "recall": cmd_recall,
+        "revitalize": cmd_revitalize,
         "decay": cmd_decay, "inspect": cmd_inspect, "add": cmd_add,
         "forget": cmd_forget, "export": cmd_export, "import": cmd_import,
+        "migrate": cmd_migrate,
     }
     cmd_map[args.command](args)
 

@@ -29,7 +29,7 @@ python3 ~/agent-memory/memory_cli.py recall \
    - **Gotchas / Errors** relevant to this work (highest priority — mistakes are expensive)
    - **Active decisions** that constrain the approach
    - **Conventions** that must be followed
-   - Omit anything with similarity below 0.3 or clearly unrelated
+   - Omit anything clearly unrelated (the CLI already enforces a similarity floor of 0.4 and includes stale memories so relevant ones can resurface)
 
 4. If the DB is unreachable, say so briefly and continue.
 

@@ -32,6 +32,7 @@ CREATE TABLE IF NOT EXISTS memories (
     content         TEXT NOT NULL,
     content_embedding VECTOR(768),
     confidence      REAL NOT NULL DEFAULT 1.0 CHECK (confidence >= 0.0 AND confidence <= 1.0),
+    decay_multiplier REAL NOT NULL DEFAULT 1.0 CHECK (decay_multiplier >= 0.0 AND decay_multiplier <= 1.0),
     status          TEXT NOT NULL DEFAULT 'active' CHECK (status IN (
                         'active', 'stale', 'archived', 'superseded'
                     )),
@@ -50,7 +51,7 @@ CREATE TABLE IF NOT EXISTS schema_version (
     applied_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-INSERT INTO schema_version (version) VALUES (1) ON CONFLICT DO NOTHING;
+INSERT INTO schema_version (version) VALUES (3) ON CONFLICT DO NOTHING;
 """
 
 

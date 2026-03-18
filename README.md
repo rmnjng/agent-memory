@@ -6,7 +6,8 @@ Persistent semantic memory for AI coding agents. Stores per-project memories, ar
 
 - **Add** — agent stores a memory after completing work: a convention learned, a gotcha hit, a decision made
 - **Recall** — agent queries before starting a task; gets back the most semantically similar memories ranked by similarity + confidence + recency
-- **Decay** — on each recall, retrieved memories gain confidence (+0.1); everything else loses a little (-0.005). Relevant memories stay alive; stale ones fade naturally
+- **Decay** — on each recall, retrieved memories gain confidence (+0.1); unrelated ones (similarity < 0.4 to the query) decay gradually. Rate is dynamic — slows automatically as the pool grows. Category matters: gotchas and conventions decay 5× slower than preferences. Per-memory longevity flags (`--longevity high|normal`) add another layer of control
+- **Revitalize** — run `revitalize` to floor-raise all decayed memories back to a baseline confidence after a long sprint on an unrelated feature
 - **Web UI** — browse, search, edit, and manage all memories at `localhost:7337`
 
 The embedding model (`nomic-ai/nomic-embed-text-v1.5`) runs as a persistent HTTP server inside the web process, so the CLI avoids cold-loading a 270MB model on every call.
@@ -100,6 +101,15 @@ python3 memory_cli.py add \
 The S3 bucket env var is STORAGE_BUCKET_NAME, not S3_BUCKET.
 MEMORY
 
+# Add a long-lived memory (good for core architectural decisions — decays over thousands of sessions)
+python3 memory_cli.py add \
+  --project myapp \
+  --category decision \
+  --longevity high \
+  --content - <<'MEMORY'
+Auth tokens are stored in httpOnly cookies, never localStorage — security requirement.
+MEMORY
+
 # Recall before a task
 python3 memory_cli.py recall \
   --project myapp \
@@ -113,8 +123,17 @@ python3 memory_cli.py status --project myapp
 # Browse memories
 python3 memory_cli.py inspect --project myapp --status active
 
+# Revitalize — boost all decayed memories back to a confidence floor
+# (useful after a long sprint on feature X that buried feature Y memories)
+python3 memory_cli.py revitalize --project myapp
+python3 memory_cli.py revitalize --project myapp --dry-run          # preview count
+python3 memory_cli.py revitalize --project myapp --min-confidence 0.8  # stricter floor
+
+# Apply pending schema migrations (safe to re-run)
+python3 memory_cli.py migrate
+
 # Run decay cycle manually
-python3 memory_cli.py decay --project myapp
+python3 memory_cli.py decay --project myapp --dry-run
 
 # Archive a memory (or hard-delete with --hard)
 python3 memory_cli.py forget --id <uuid>
@@ -151,7 +170,7 @@ claude/           — Claude Code command files (recall.md, remember.md)
 
 **Embedding model:** `nomic-ai/nomic-embed-text-v1.5` via sentence-transformers (768-dim). Downloaded once to the HuggingFace cache (~270MB). The web server loads it once and serves embeddings over HTTP; the CLI calls this endpoint with a 2s timeout and falls back to local model load if unavailable.
 
-**Decay:** Recall-based, not time-based. Every recall bumps retrieved memories (+0.1 confidence, capped at 1.0) and slightly decays everything else (-0.005). A memory that's never relevant to any query gradually fades to stale then archived. Dormant projects don't decay.
+**Decay:** Recall-based, not time-based. Every recall bumps retrieved memories (+0.1 confidence, capped at 1.0). Memories with cosine similarity < 0.4 to the current query are passively decayed — memories near the top-k boundary but still relevant are explicitly exempt. The decay rate is dynamic: `base_rate / max(1, active_count / 150)`, so a large pool decays more slowly. Categories have built-in multipliers (gotcha/convention: 0.2×, decision: 0.3×, pattern: 0.7×), and each memory has an optional `decay_multiplier` column (set via `--longevity high`) for per-memory control. There is no "permanent" — even long-lived memories eventually fade if truly abandoned, preventing stale facts from accumulating forever. A memory that's never semantically relevant to any query gradually fades to stale (< 0.3) then archived (< 0.1). Dormant projects don't decay.
 
 ## Environment variables
 

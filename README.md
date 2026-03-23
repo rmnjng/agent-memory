@@ -8,7 +8,7 @@ Persistent semantic memory for AI coding agents. Stores per-project memories, ar
 - **Recall** — agent queries before starting a task; gets back the most semantically similar memories ranked by similarity + confidence + recency
 - **Decay** — on each recall, retrieved memories gain confidence (+0.1); unrelated ones (similarity < 0.4 to the query) decay gradually. Rate is dynamic — slows automatically as the pool grows. Category matters: gotchas and conventions decay 5× slower than preferences. Per-memory longevity flags (`--longevity high|normal`) add another layer of control
 - **Revitalize** — run `revitalize` to floor-raise all decayed memories back to a baseline confidence after a long sprint on an unrelated feature
-- **Web UI** — browse, search, edit, and manage all memories at `localhost:7337`
+- **Web UI** — browse, search, and manage memories at `localhost:7337`. Includes a UMAP scatter-plot map, a force-directed similarity graph, a creation timeline, and HDBSCAN cluster analysis. The map and graph have query drawers: type a query to embed it in real time and see which memories light up
 
 The embedding model (`nomic-ai/nomic-embed-text-v1.5`) runs as a persistent HTTP server inside the web process, so the CLI avoids cold-loading a 270MB model on every call.
 
@@ -152,8 +152,6 @@ python3 memory_cli.py import --input backup.json
 | `pattern` | Recurring approaches and workflows |
 | `decision` | Architectural choices that constrain future work |
 | `preference` | User or team preferences |
-| `dependency` | Library choices, version constraints |
-| `optimization` | Performance tricks and benchmarks |
 
 ## Architecture
 
@@ -161,6 +159,10 @@ python3 memory_cli.py import --input backup.json
 bootstrap_db.py   — one-time setup: pulls pgvector Docker image, creates schema
 memory_cli.py     — CLI: add / recall / decay / inspect / export / import / status
 web.py            — Flask web UI at :7337 + POST /api/embed embedding server
+                     Tabs: Memories (list), Map (UMAP 2D), Graph (force-directed),
+                     Timeline (stacked bar), Clusters (HDBSCAN)
+                     APIs: /api/memories, /api/map, /api/map/query, /api/graph,
+                     /api/timeline, /api/clusters, /api/embed
 start.sh          — starts Docker container + web.py
 agent-memory.service — systemd user service for auto-start
 claude/           — Claude Code command files (recall.md, remember.md)
@@ -170,7 +172,9 @@ claude/           — Claude Code command files (recall.md, remember.md)
 
 **Embedding model:** `nomic-ai/nomic-embed-text-v1.5` via sentence-transformers (768-dim). Downloaded once to the HuggingFace cache (~270MB). The web server loads it once and serves embeddings over HTTP; the CLI calls this endpoint with a 2s timeout and falls back to local model load if unavailable.
 
-**Decay:** Recall-based, not time-based. Every recall bumps retrieved memories (+0.1 confidence, capped at 1.0). Memories with cosine similarity < 0.4 to the current query are passively decayed — memories near the top-k boundary but still relevant are explicitly exempt. The decay rate is dynamic: `base_rate / max(1, active_count / 150)`, so a large pool decays more slowly. Categories have built-in multipliers (gotcha/convention: 0.2×, decision: 0.3×, pattern: 0.7×), and each memory has an optional `decay_multiplier` column (set via `--longevity high`) for per-memory control. There is no "permanent" — even long-lived memories eventually fade if truly abandoned, preventing stale facts from accumulating forever. A memory that's never semantically relevant to any query gradually fades to stale (< 0.3) then archived (< 0.1). Dormant projects don't decay.
+**Supersedence:** When a new memory is added, any existing active memory with cosine similarity > 0.85 is automatically marked as superseded, with `superseded_by` pointing to the new memory's ID. This works across categories — a `gotcha` can supersede a `pattern` if the content is similar enough. This prevents duplicates from accumulating as knowledge evolves.
+
+**Decay:** Recall-based, not time-based. Every recall bumps retrieved memories (+0.1 confidence, capped at 1.0). Memories with cosine similarity < 0.4 to the current query are passively decayed — memories near the top-k boundary but still relevant are explicitly exempt. The decay rate is dynamic: `base_rate / max(1, active_count / 150)`, so a large pool decays more slowly. Categories have built-in multipliers (gotcha/convention: 0.2×, decision: 0.3×, pattern: 0.7×, preference: 1.0×), and each memory has an optional `decay_multiplier` column (set via `--longevity high`) for per-memory control. There is no "permanent" — even long-lived memories eventually fade if truly abandoned, preventing stale facts from accumulating forever. A memory that's never semantically relevant to any query gradually fades to stale (< 0.3) then archived (< 0.1). Dormant projects don't decay.
 
 ## Environment variables
 

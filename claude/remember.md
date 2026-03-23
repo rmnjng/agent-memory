@@ -37,7 +37,7 @@ Core architectural fact unlikely to change for the life of this project.
 MEMORY
 ```
 
-Categories: `convention`, `gotcha`, `pattern`, `preference`, `dependency`, `optimization`, `decision`
+Categories: `convention`, `gotcha`, `pattern`, `preference`, `decision`
 
 Guidelines:
 - One memory per fact. "S3 env vars are named X not Y" is one memory. "dotenv loads from cwd" is another.

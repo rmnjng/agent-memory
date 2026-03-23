@@ -27,7 +27,7 @@ CREATE TABLE IF NOT EXISTS memories (
     project         TEXT NOT NULL,
     category        TEXT NOT NULL CHECK (category IN (
                         'convention', 'pattern', 'preference',
-                        'dependency', 'gotcha', 'optimization', 'decision'
+                        'gotcha', 'decision'
                     )),
     content         TEXT NOT NULL,
     content_embedding VECTOR(768),

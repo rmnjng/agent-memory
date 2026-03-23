@@ -2,3 +2,5 @@ psycopg2-binary>=2.9
 pgvector>=0.2.5
 flask>=3.0
 sentence-transformers>=2.7
+umap-learn>=0.5
+hdbscan>=0.8.33

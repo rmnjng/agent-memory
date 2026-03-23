@@ -41,7 +41,7 @@ DEFAULT_MODEL = os.environ.get(
 )
 EMBED_SERVER_URL = os.environ.get("AGENT_MEMORY_EMBED_URL", "http://localhost:7337")
 
-CATEGORIES = ["convention", "gotcha", "pattern", "preference", "dependency", "optimization", "decision"]
+CATEGORIES = ["convention", "gotcha", "pattern", "preference", "decision"]
 
 # Base passive decay per recall — actual rate is dynamic: BASE / max(1, active_count / REFERENCE_POOL)
 PASSIVE_DECAY_BASE = 0.005
@@ -60,10 +60,8 @@ CATEGORY_DECAY_MULTIPLIERS = {
     "gotcha":       0.2,
     "convention":   0.2,
     "decision":     0.3,
-    "dependency":   0.5,
     "pattern":      0.7,
     "preference":   1.0,
-    "optimization": 1.0,
 }
 
 # Per-memory longevity → decay_multiplier stored on the row.
@@ -330,7 +328,6 @@ def cmd_recall(args):
                             WHEN 'gotcha'       THEN 0.2
                             WHEN 'convention'   THEN 0.2
                             WHEN 'decision'     THEN 0.3
-                            WHEN 'dependency'   THEN 0.5
                             WHEN 'pattern'      THEN 0.7
                             ELSE 1.0
                         END * decay_multiplier
@@ -363,7 +360,6 @@ def cmd_recall(args):
                             WHEN 'gotcha'       THEN 0.2
                             WHEN 'convention'   THEN 0.2
                             WHEN 'decision'     THEN 0.3
-                            WHEN 'dependency'   THEN 0.5
                             WHEN 'pattern'      THEN 0.7
                             ELSE 1.0
                         END * decay_multiplier
@@ -476,7 +472,6 @@ def cmd_decay(args):
                             WHEN 'gotcha'       THEN 0.2
                             WHEN 'convention'   THEN 0.2
                             WHEN 'decision'     THEN 0.3
-                            WHEN 'dependency'   THEN 0.5
                             WHEN 'pattern'      THEN 0.7
                             ELSE 1.0
                         END * decay_multiplier
@@ -562,22 +557,22 @@ def cmd_add(args):
         VALUES (%s, %s, %s, %s, %s::vector, %s)
     """, (mem_id, args.project, args.category, content, content_vec, decay_multiplier))
 
-    # Check for near-duplicates and supersede them
+    # Check for near-duplicates and supersede them (cross-category)
     superseded = 0
     cur.execute("""
         SELECT id, content, 1 - (content_embedding <=> %s::vector) AS similarity
         FROM memories
-        WHERE project = %s AND category = %s AND status = 'active' AND id != %s
+        WHERE project = %s AND status = 'active' AND id != %s
         ORDER BY similarity DESC
-        LIMIT 3
-    """, (content_vec, args.project, args.category, mem_id))
+        LIMIT 5
+    """, (content_vec, args.project, mem_id))
 
     for row in cur.fetchall():
         if row[2] > 0.85:
             cur.execute("""
-                UPDATE memories SET status = 'superseded', updated_at = NOW()
+                UPDATE memories SET status = 'superseded', superseded_by = %s, updated_at = NOW()
                 WHERE id = %s
-            """, (row[0],))
+            """, (mem_id, row[0]))
             superseded += 1
 
     conn.commit()
@@ -696,25 +691,26 @@ def cmd_import(args):
 
 # ─── Supersede check (internal) ──────────────────────────────────────────────
 
-def _check_contradictions(cur, project: str, new_memories: list[dict]) -> int:
-    """Check if new memories contradict existing ones. Same category, high similarity → supersede."""
+def _check_contradictions(cur, project: str, new_memories: list[dict], new_id: Optional[str] = None) -> int:
+    """Check if new memories contradict existing ones. High similarity → supersede (cross-category)."""
     superseded = 0
     for mem in new_memories:
         vec = embed(mem["content"])
-        cur.execute("""
+        exclude = f"AND id != '{new_id}'" if new_id else ""
+        cur.execute(f"""
             SELECT id, content, 1 - (content_embedding <=> %s::vector) AS similarity
             FROM memories
-            WHERE project = %s AND category = %s AND status = 'active'
+            WHERE project = %s AND status = 'active' {exclude}
             ORDER BY similarity DESC
-            LIMIT 3
-        """, (vec, project, mem["category"]))
+            LIMIT 5
+        """, (vec, project))
 
         for row in cur.fetchall():
             if row[2] > 0.85:
                 cur.execute("""
-                    UPDATE memories SET status = 'superseded', updated_at = NOW()
+                    UPDATE memories SET status = 'superseded', superseded_by = %s, updated_at = NOW()
                     WHERE id = %s
-                """, (row[0],))
+                """, (new_id, row[0]))
                 superseded += 1
 
     return superseded

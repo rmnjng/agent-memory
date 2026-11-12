@@ -1,7 +1,11 @@
 psycopg2-binary>=2.9
 pgvector>=0.2.5
 flask>=3.0
-sentence-transformers>=2.7
+# Pinned: nomic-embed-text-v1.5's remote code breaks on newer transformers
+# ('NomicBertModel' has no 'get_extended_attention_mask'; transformers 5.22,
+# sentence-transformers 6.3, 2026-11-12). Raise only after a recall test.
+sentence-transformers==5.2.3
+transformers==5.2.0
 umap-learn>=0.5
 hdbscan>=0.8.33
 einops>=0.7

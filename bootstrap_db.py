@@ -45,13 +45,45 @@ CREATE TABLE IF NOT EXISTS memories (
 CREATE INDEX IF NOT EXISTS idx_memories_project_status ON memories(project, status);
 CREATE INDEX IF NOT EXISTS idx_memories_confidence ON memories(confidence DESC);
 
+-- Configuration: system-level tuning parameters
+CREATE TABLE IF NOT EXISTS config (
+    key             TEXT PRIMARY KEY,
+    value           TEXT NOT NULL,
+    default_value   TEXT NOT NULL,
+    value_type      TEXT NOT NULL CHECK (value_type IN ('float', 'int', 'json')),
+    group_name      TEXT NOT NULL,
+    description     TEXT NOT NULL,
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+INSERT INTO config (key, value, default_value, value_type, group_name, description) VALUES
+    ('decay.passive_base',          '0.005', '0.005', 'float', 'decay',     'Base passive decay applied per recall cycle'),
+    ('decay.reference_pool_size',   '150',   '150',   'int',   'decay',     'Pool size at which full base decay rate applies; larger pools decay slower'),
+    ('decay.stale_threshold',       '0.3',   '0.3',   'float', 'decay',     'Confidence below which a memory becomes stale'),
+    ('decay.archive_threshold',     '0.1',   '0.1',   'float', 'decay',     'Confidence below which a memory is archived'),
+    ('decay.sim_floor',             '0.4',   '0.4',   'float', 'decay',     'Minimum cosine similarity for recall results; also exempts nearby memories from passive decay'),
+    ('decay.category_multipliers',  '{"gotcha":0.2,"convention":0.2,"decision":0.3,"pattern":0.7,"preference":1.0}',
+                                    '{"gotcha":0.2,"convention":0.2,"decision":0.3,"pattern":0.7,"preference":1.0}',
+                                    'json', 'decay', 'Per-category decay rate multipliers (lower = slower decay)'),
+    ('decay.longevity_values',      '{"high":0.2,"normal":1.0}',
+                                    '{"high":0.2,"normal":1.0}',
+                                    'json', 'decay', 'Per-longevity decay multipliers for --longevity flag'),
+    ('recall.weight_similarity',    '0.5',   '0.5',   'float', 'recall',    'Scoring weight for cosine similarity (sum of all weights should be 1.0)'),
+    ('recall.weight_confidence',    '0.3',   '0.3',   'float', 'recall',    'Scoring weight for confidence'),
+    ('recall.weight_recency',       '0.2',   '0.2',   'float', 'recall',    'Scoring weight for recency'),
+    ('recall.confidence_boost',     '0.1',   '0.1',   'float', 'recall',    'Confidence boost applied to retrieved memories'),
+    ('supersede.similarity_threshold', '0.85', '0.85', 'float', 'supersede', 'Cosine similarity above which a new memory supersedes an existing one'),
+    ('ui.graph_edge_threshold',     '0.75',  '0.75',  'float', 'ui',        'Default similarity threshold for graph view edges'),
+    ('ui.cluster_min_size',         '3',     '3',     'int',   'ui',        'Default minimum cluster size for HDBSCAN')
+ON CONFLICT DO NOTHING;
+
 -- Schema version tracking
 CREATE TABLE IF NOT EXISTS schema_version (
     version     INTEGER PRIMARY KEY,
     applied_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-INSERT INTO schema_version (version) VALUES (3) ON CONFLICT DO NOTHING;
+INSERT INTO schema_version (version) VALUES (4) ON CONFLICT DO NOTHING;
 """
 
 

@@ -364,7 +364,8 @@ def api_graph():
     import numpy as np
 
     project = request.args.get("project", "")
-    threshold = float(request.args.get("threshold", 0.75))
+    default_threshold = _get_config_value("ui.graph_edge_threshold", 0.75)
+    threshold = float(request.args.get("threshold", default_threshold))
 
     cache, err = _load_map_data(project, "active")
     if err:
@@ -401,7 +402,8 @@ def api_clusters():
     import re
 
     project = request.args.get("project", "")
-    min_size = int(request.args.get("min_size", 3))
+    default_min_size = _get_config_value("ui.cluster_min_size", 3)
+    min_size = int(request.args.get("min_size", default_min_size))
 
     cache, err = _load_map_data(project, "active")
     if err:
@@ -525,6 +527,134 @@ def delete_memory(mem_id):
         cur.execute("UPDATE memories SET status = 'archived', updated_at = NOW() WHERE id = %s", (mem_id,))
     conn.close()
     return jsonify({"ok": True}) if cur.rowcount else (jsonify({"error": "not found"}), 404)
+
+
+# ── Config ───────────────────────────────────────────────────────────────────
+
+_config_cache = None
+_config_lock = threading.Lock()
+
+
+def _invalidate_config_cache():
+    global _config_cache
+    with _config_lock:
+        _config_cache = None
+
+
+def _get_config_value(key, fallback=None):
+    """Get a single config value from DB with caching."""
+    global _config_cache
+    with _config_lock:
+        if _config_cache is None:
+            cache = {}
+            try:
+                conn = get_conn()
+                cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+                cur.execute("SELECT key, value, value_type FROM config")
+                for row in cur.fetchall():
+                    vtype = row["value_type"]
+                    try:
+                        if vtype == "float": cache[row["key"]] = float(row["value"])
+                        elif vtype == "int": cache[row["key"]] = int(row["value"])
+                        elif vtype == "json": cache[row["key"]] = json.loads(row["value"])
+                        else: cache[row["key"]] = row["value"]
+                    except (ValueError, json.JSONDecodeError):
+                        pass  # skip bad rows, use fallback
+                conn.close()
+            except Exception:
+                pass
+            _config_cache = cache
+        return _config_cache.get(key, fallback)
+
+
+@app.get("/api/config")
+def api_config():
+    conn = get_conn()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("SELECT key, value, default_value, value_type, group_name, description, updated_at FROM config ORDER BY group_name, key")
+    rows = cur.fetchall()
+    conn.close()
+
+    groups = {}
+    for row in rows:
+        row["updated_at"] = row["updated_at"].isoformat() if row["updated_at"] else None
+        g = row["group_name"]
+        if g not in groups:
+            groups[g] = []
+        groups[g].append(row)
+
+    return jsonify({"groups": groups})
+
+
+@app.put("/api/config/<path:key>")
+def update_config(key):
+    data = request.get_json() or {}
+    new_value = data.get("value")
+    if new_value is None:
+        return jsonify({"error": "value required"}), 400
+
+    conn = get_conn()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+    # Fetch current row to validate type
+    cur.execute("SELECT value_type FROM config WHERE key = %s", (key,))
+    row = cur.fetchone()
+    if not row:
+        conn.close()
+        return jsonify({"error": f"unknown config key: {key}"}), 404
+
+    vtype = row["value_type"]
+    try:
+        raw = str(new_value)
+        if vtype == "float": parsed = float(raw)
+        elif vtype == "int": parsed = int(raw)
+        elif vtype == "json": parsed = json.loads(raw)
+        else: parsed = raw
+    except (ValueError, json.JSONDecodeError) as e:
+        conn.close()
+        return jsonify({"error": f"invalid value for type {vtype}: {e}"}), 400
+
+    # Range validation
+    if vtype == "float":
+        if parsed < 0:
+            conn.close()
+            return jsonify({"error": f"value must be >= 0 (got {parsed})"}), 400
+        if key.endswith("_threshold") and parsed > 1.0:
+            conn.close()
+            return jsonify({"error": f"threshold values must be <= 1.0 (got {parsed})"}), 400
+    elif vtype == "int":
+        if parsed < 1:
+            conn.close()
+            return jsonify({"error": f"value must be >= 1 (got {parsed})"}), 400
+    elif vtype == "json":
+        if not isinstance(parsed, dict):
+            conn.close()
+            return jsonify({"error": "JSON config values must be objects"}), 400
+
+    cur.execute("UPDATE config SET value = %s, updated_at = NOW() WHERE key = %s", (str(new_value), key))
+    conn.close()
+    _invalidate_config_cache()
+    return jsonify({"ok": True, "key": key, "value": str(new_value)})
+
+
+@app.post("/api/config/reset")
+def reset_config():
+    data = request.get_json() or {}
+    key = data.get("key")
+
+    conn = get_conn()
+    cur = conn.cursor()
+    if key:
+        cur.execute("UPDATE config SET value = default_value, updated_at = NOW() WHERE key = %s", (key,))
+    elif data.get("all"):
+        cur.execute("UPDATE config SET value = default_value, updated_at = NOW()")
+    else:
+        conn.close()
+        return jsonify({"error": "provide key or all:true"}), 400
+
+    conn.close()
+    _invalidate_config_cache()
+    return jsonify({"ok": True, "reset": key or "all"})
 
 
 # ── UI ─────────────────────────────────────────────────────────────────────────
@@ -727,6 +857,26 @@ HTML = """<!DOCTYPE html>
   .cluster-stat .sub { font-size: 11px; color: #484f58; margin-top: 2px; }
   .cluster-chevron { color: #484f58; transition: transform 0.15s; font-size: 14px; }
   .cluster-chevron.open { transform: rotate(90deg); }
+
+  /* config */
+  .cfg-group { margin-bottom: 20px; }
+  .cfg-group h3 { color: #8b949e; font-size: 11px; text-transform: uppercase;
+                  letter-spacing: 0.06em; margin-bottom: 10px; padding-bottom: 6px;
+                  border-bottom: 1px solid #21262d; }
+  .cfg-row { display: flex; align-items: flex-start; gap: 12px; padding: 10px 0;
+             border-bottom: 1px solid #161b22; }
+  .cfg-label { flex: 1; min-width: 0; }
+  .cfg-key { font-size: 12px; color: #c9d1d9; font-weight: 600; margin-bottom: 2px; }
+  .cfg-desc { font-size: 11px; color: #6e7681; line-height: 1.4; }
+  .cfg-input-wrap { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
+  .cfg-input { width: 160px; background: #161b22; border: 1px solid #30363d; color: #c9d1d9;
+               padding: 6px 10px; border-radius: 6px; font-size: 12px; font-family: inherit; outline: none; }
+  .cfg-input:focus { border-color: #58a6ff; }
+  .cfg-input.json { width: 320px; }
+  .cfg-default { font-size: 10px; color: #484f58; margin-top: 4px; }
+  .cfg-modified { border-color: #d29922 !important; }
+  .cfg-actions { display: flex; gap: 4px; margin-top: 4px; }
+  .cfg-toolbar { display: flex; justify-content: flex-end; margin-bottom: 16px; }
   .cluster-chart { position: relative; min-height: 350px; height: calc(50vh - 80px);
                    margin: 0 -24px 20px; padding: 0; width: calc(100% + 48px);
                    background: #161b22; border-top: 1px solid #21262d;
@@ -831,8 +981,8 @@ HTML = """<!DOCTYPE html>
 
 <script>
 const CATEGORIES = ['convention','gotcha','pattern','preference','decision'];
-const TABS = ['memories', 'stats', 'map', 'graph', 'clusters', 'timeline'];
-const TAB_LABELS = { memories: 'Memories', stats: 'Stats', map: 'Map', graph: 'Graph', clusters: 'Clusters', timeline: 'Timeline' };
+const TABS = ['memories', 'stats', 'map', 'graph', 'clusters', 'timeline', 'config'];
+const TAB_LABELS = { memories: 'Memories', stats: 'Stats', map: 'Map', graph: 'Graph', clusters: 'Clusters', timeline: 'Timeline', config: 'Config' };
 let currentTab = 'memories';
 let statusFilter = '';
 let debounceTimer;
@@ -953,6 +1103,7 @@ async function loadTab() {
     if (currentTab === 'graph')    { await loadGraph(); return; }
     if (currentTab === 'clusters') { await loadClusters(); return; }
     if (currentTab === 'timeline') { await loadTimeline(); return; }
+    if (currentTab === 'config')   { await loadConfig(); return; }
     const res = await fetch(`/api/memories?${buildQuery()}`);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const rows = await res.json();
@@ -2474,6 +2625,106 @@ function highlightGraphResult(drawerIdx) {
     graphHighlightIdx = graphNodes.findIndex(n => n.id === targetId);
   }
   drawGraph();
+}
+
+// ── Config tab ────────────────────────────────────────────────────────────────
+
+const GROUP_LABELS = { decay: 'Decay Parameters', recall: 'Recall Scoring', supersede: 'Supersedence', ui: 'UI Defaults' };
+const GROUP_ORDER = ['decay', 'recall', 'supersede', 'ui'];
+
+async function loadConfig() {
+  const content = document.getElementById('content');
+  try {
+    const res = await fetch('/api/config');
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    content.innerHTML = renderConfigGroups(data.groups);
+  } catch(e) {
+    content.innerHTML = `<div class="err-msg">Error: ${esc(e.message)}</div>`;
+  }
+}
+
+function renderConfigGroups(groups) {
+  let html = `<div class="cfg-toolbar">
+    <button class="btn" onclick="resetAllConfig()">Reset all to defaults</button>
+  </div>`;
+
+  for (const gname of GROUP_ORDER) {
+    const items = groups[gname];
+    if (!items) continue;
+    html += `<div class="cfg-group"><h3>${esc(GROUP_LABELS[gname] || gname)}</h3>`;
+    for (const item of items) {
+      const isJson = item.value_type === 'json';
+      const modified = item.value !== item.default_value;
+      const modClass = modified ? ' cfg-modified' : '';
+      const inputClass = `cfg-input${isJson ? ' json' : ''}${modClass}`;
+      html += `<div class="cfg-row">
+        <div class="cfg-label">
+          <div class="cfg-key">${esc(item.key)}</div>
+          <div class="cfg-desc">${esc(item.description)}</div>
+          <div class="cfg-default">default: ${esc(item.default_value)}</div>
+        </div>
+        <div>
+          <div class="cfg-input-wrap">
+            <input class="${inputClass}" data-cfg-key="${esc(item.key)}"
+                   value="${esc(isJson ? formatJson(item.value) : item.value)}"
+                   onkeydown="if(event.key==='Enter')saveConfig('${esc(item.key)}')">
+            <button class="btn btn-primary" onclick="saveConfig('${esc(item.key)}')">Save</button>
+          </div>
+          <div class="cfg-actions">
+            ${modified ? `<button class="btn" onclick="resetConfig('${esc(item.key)}')">Reset</button>` : ''}
+          </div>
+        </div>
+      </div>`;
+    }
+    html += '</div>';
+  }
+  return html;
+}
+
+function formatJson(s) {
+  try { return JSON.stringify(JSON.parse(s)); }
+  catch { return s; }
+}
+
+async function saveConfig(key) {
+  const input = document.querySelector(`[data-cfg-key="${key}"]`);
+  if (!input) return;
+  try {
+    const res = await fetch('/api/config/' + encodeURIComponent(key), {
+      method: 'PUT',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({value: input.value.trim()})
+    });
+    const data = await res.json();
+    if (!res.ok) { alert('Error: ' + (data.error || res.status)); return; }
+    loadConfig();
+  } catch(e) { alert('Error: ' + e.message); }
+}
+
+async function resetConfig(key) {
+  try {
+    const res = await fetch('/api/config/reset', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({key})
+    });
+    if (!res.ok) { const d = await res.json(); alert('Error: ' + d.error); return; }
+    loadConfig();
+  } catch(e) { alert('Error: ' + e.message); }
+}
+
+async function resetAllConfig() {
+  if (!confirm('Reset all config values to defaults?')) return;
+  try {
+    const res = await fetch('/api/config/reset', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({all: true})
+    });
+    if (!res.ok) { const d = await res.json(); alert('Error: ' + d.error); return; }
+    loadConfig();
+  } catch(e) { alert('Error: ' + e.message); }
 }
 
 init();

@@ -15,7 +15,7 @@ The embedding model (`nomic-ai/nomic-embed-text-v1.5`) runs as a persistent HTTP
 ## Prerequisites
 
 - Python 3.10+
-- Docker
+- Docker (or Docker Desktop with WSL2 backend on Windows)
 
 ## Quick start
 
@@ -82,6 +82,16 @@ cp agent-memory.service ~/.config/systemd/user/
 systemctl --user daemon-reload
 systemctl --user enable --now agent-memory.service
 ```
+
+**Auto-start on login — Windows (WSL2):**
+
+WSL2 supports systemd on Ubuntu 22.04+. Enable it first if you haven't:
+```bash
+# Add to /etc/wsl.conf (requires admin/sudo)
+sudo sh -c 'echo -e "[boot]\nsystemd=true" >> /etc/wsl.conf'
+# Then restart WSL from PowerShell: wsl --shutdown
+```
+Once systemd is enabled, use the Linux systemd instructions above. Ports (7337, 5433) are automatically forwarded to Windows — the web UI is accessible at `localhost:7337` from your Windows browser.
 
 **Auto-start on login — macOS (launchd):**
 ```bash
@@ -159,10 +169,11 @@ python3 memory_cli.py import --input backup.json
 bootstrap_db.py   — one-time setup: pulls pgvector Docker image, creates schema
 memory_cli.py     — CLI: add / recall / decay / inspect / export / import / status
 web.py            — Flask web UI at :7337 + POST /api/embed embedding server
+api.py            — token-checked recall/add API at :7338 for remote CLIs (see «Remote use»)
                      Tabs: Memories (list), Map (UMAP 2D), Graph (force-directed),
-                     Timeline (stacked bar), Clusters (HDBSCAN)
+                     Timeline (stacked bar), Clusters (HDBSCAN), Config
                      APIs: /api/memories, /api/map, /api/map/query, /api/graph,
-                     /api/timeline, /api/clusters, /api/embed
+                     /api/timeline, /api/clusters, /api/config, /api/embed
 start.sh          — starts Docker container + web.py
 agent-memory.service — systemd user service for auto-start
 claude/           — Claude Code command files (recall.md, remember.md)
@@ -172,9 +183,36 @@ claude/           — Claude Code command files (recall.md, remember.md)
 
 **Embedding model:** `nomic-ai/nomic-embed-text-v1.5` via sentence-transformers (768-dim). Downloaded once to the HuggingFace cache (~270MB). The web server loads it once and serves embeddings over HTTP; the CLI calls this endpoint with a 2s timeout and falls back to local model load if unavailable.
 
-**Supersedence:** When a new memory is added, any existing active memory with cosine similarity > 0.85 is automatically marked as superseded, with `superseded_by` pointing to the new memory's ID. This works across categories — a `gotcha` can supersede a `pattern` if the content is similar enough. This prevents duplicates from accumulating as knowledge evolves.
+**Configuration:** All tuning parameters (decay rates, scoring weights, similarity thresholds) are stored in a `config` database table and editable via the Config tab in the web UI. Changes take effect immediately — no restart needed. The CLI and web server fall back to hardcoded defaults if the config table is missing (pre-migration).
+
+**Supersedence:** When a new memory is added, any existing active memory with cosine similarity above the configured threshold (default 0.85) is automatically marked as superseded, with `superseded_by` pointing to the new memory's ID. This works across categories — a `gotcha` can supersede a `pattern` if the content is similar enough. This prevents duplicates from accumulating as knowledge evolves.
 
 **Decay:** Recall-based, not time-based. Every recall bumps retrieved memories (+0.1 confidence, capped at 1.0). Memories with cosine similarity < 0.4 to the current query are passively decayed — memories near the top-k boundary but still relevant are explicitly exempt. The decay rate is dynamic: `base_rate / max(1, active_count / 150)`, so a large pool decays more slowly. Categories have built-in multipliers (gotcha/convention: 0.2×, decision: 0.3×, pattern: 0.7×, preference: 1.0×), and each memory has an optional `decay_multiplier` column (set via `--longevity high`) for per-memory control. There is no "permanent" — even long-lived memories eventually fade if truly abandoned, preventing stale facts from accumulating forever. A memory that's never semantically relevant to any query gradually fades to stale (< 0.3) then archived (< 0.1). Dormant projects don't decay.
+
+## Remote use (API)
+
+People without database access use the CLI against `api.py` on the machine that holds the memory DB. The client needs only `python3` and `memory_cli.py` — no psycopg2, no model; the server embeds.
+
+On the server:
+
+```bash
+python3 api.py --port 7338                               # beside web.py (it embeds through :7337)
+python3 memory_cli.py key add anna --scopes recall       # recall only
+python3 memory_cli.py key add ci-bot --scopes recall,add # may also add
+python3 memory_cli.py key list
+python3 memory_cli.py key revoke anna
+```
+
+`key add` prints `AGENT_MEMORY_API_TOKEN=…` once; only its SHA-256 is stored (table `api_keys`). On the client:
+
+```bash
+export AGENT_MEMORY_API_URL=http://<server>:7338
+export AGENT_MEMORY_API_TOKEN=am_…
+python3 memory_cli.py status      # shows the key's name and scopes
+python3 memory_cli.py recall --project myapp --query "…"
+```
+
+Over the API only `status`, `recall` and `add` exist; nothing can be edited or deleted. A memory added through it has `created_by` = the key's name. Recalls boost and decay like local ones. `api.py` speaks plain HTTP: put it on an encrypted network (Tailscale, WireGuard), not on the internet.
 
 ## Environment variables
 
@@ -184,3 +222,5 @@ claude/           — Claude Code command files (recall.md, remember.md)
 | `AGENT_MEMORY_EMBED_MODEL` | `nomic-ai/nomic-embed-text-v1.5` | Embedding model |
 | `AGENT_MEMORY_EMBED_URL` | `http://localhost:7337` | Embedding server URL |
 | `PORT` | `7337` | Web server port |
+| `AGENT_MEMORY_API_URL` | — | Use a memory server's API instead of the database (remote mode) |
+| `AGENT_MEMORY_API_TOKEN` | — | Bearer token for that API (`memory_cli.py key add`) |
